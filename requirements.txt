@@ -6,3 +6,8 @@ langchain
 openai
 langchain_community
 langchain_groq
+pymongo
+python-dotenv
+
+
+

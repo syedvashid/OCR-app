@@ -786,3 +786,147 @@ code {
   font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
     monospace;
 }
+
+/* User Section Styles */
+.user-section {
+  margin-bottom: 1.5rem;
+  padding: 1.5rem;
+}
+
+.user-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.user-input {
+  padding: 0.75rem;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  border-radius: 0.5rem;
+  background: rgba(255, 255, 255, 0.9);
+  color: #333;
+  font-size: 1rem;
+}
+
+.user-input:focus {
+  outline: none;
+  border-color: #4f46e5;
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.2);
+  background: rgba(255, 255, 255, 1);
+}
+.user-input::placeholder {
+  color: #666; /* Dark placeholder text */
+}
+
+.user-hint {
+  font-size: 0.875rem;
+  color: rgba(255, 255, 255, 0.7);
+  margin: 0;
+}
+
+/* Correction Section Styles */
+.correction-section {
+  margin-top: 1.5rem;
+  padding: 1.5rem;
+}
+
+.correction-container {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.text-comparison {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+.text-box {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.text-box label {
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.readonly-text {
+  padding: 0.75rem;
+  background: rgba(255, 255, 255, 0.1);
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  border-radius: 0.5rem;
+  min-height: 3rem;
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.correction-textarea {
+  padding: 0.75rem;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  border-radius: 0.5rem;
+  background: rgba(255, 255, 255, 0.9);
+  color: #333;
+  font-family: inherit;
+  resize: vertical;
+  min-height: 3rem;
+}
+
+.correction-textarea:focus {
+  outline: none;
+  border-color: #4f46e5;
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.2);
+  background: rgba(255, 255, 255, 1);
+}
+
+.correction-actions {
+  display: flex;
+  gap: 1rem;
+  justify-content: flex-end;
+}
+
+.correction-textarea::placeholder {
+  color: #666; /* Dark placeholder text */
+}
+
+@media (max-width: 768px) {
+  .text-comparison {
+    grid-template-columns: 1fr;
+  }
+  
+  .correction-actions {
+    justify-content: stretch;
+  }
+  
+  .correction-actions button {
+    flex: 1;
+  }
+}
+/* Updated text visual feedback */
+.text-updated {
+  background: rgba(16, 185, 129, 0.1) !important;
+  border: 1px solid rgba(16, 185, 129, 0.3) !important;
+  transition: all 0.3s ease;
+}
+
+.update-indicator {
+  color: #10b981;
+  font-size: 0.875rem;
+  font-weight: normal;
+  animation: fadeInOut 3s ease-in-out;
+}
+
+@keyframes fadeInOut {
+  0% { opacity: 0; }
+  20% { opacity: 1; }
+  80% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* Highlight selected text area when updated */
+.selected-text-display.text-updated p {
+  color: #10b981 !important;
+  font-weight: bold;
+  transition: all 0.3s ease;
+}

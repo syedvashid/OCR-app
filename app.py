@@ -9,6 +9,7 @@ from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate
 from langchain.chains import LLMChain
 from langchain_core.messages import HumanMessage, SystemMessage
 from configration import llm, llm1
+from Database import save_user_correction, get_learned_patterns, apply_learned_corrections,create_image_hash, initialize_database, db
 
 # Load environment variables
 load_dotenv()
@@ -174,17 +175,16 @@ def health_check():
 @app.route('/process-ocr', methods=['POST'])
 def process_ocr():
     """
-    Process OCR request with LLM refinement
-    Expects: JSON with base64 encoded image data
-    Returns: JSON with original text and refined suggestions
+    Process OCR request with learning integration
     """
     try:
         # Check if request has JSON data
         if not request.json or 'image' not in request.json:
             return jsonify({"error": "No image data provided"}), 400
         
-        # Get base64 image data
+        # Get base64 image data and user ID
         image_base64 = request.json['image']
+        user_id = request.json.get('user_id', 'anonymous')
         
         # Remove data URL prefix if present
         if ',' in image_base64:
@@ -193,6 +193,7 @@ def process_ocr():
         # Decode base64 to binary data
         try:
             image_data = base64.b64decode(image_base64)
+            image_hash = create_image_hash(image_data)
         except Exception as e:
             return jsonify({"error": "Invalid base64 image data"}), 400
         
@@ -200,21 +201,28 @@ def process_ocr():
         extracted_text = process_with_azure_ocr(image_data)
         print(f"Extracted text: {extracted_text}")
         
-        # Refine content with LLM if text is found
+        # Apply learned corrections BEFORE LLM processing
+        learned_corrected_text, applied_corrections = apply_learned_corrections(extracted_text, user_id)
+        print(f"Applied corrections: {applied_corrections}")
+        
+        # Refine content with LLM using the learned-corrected text
         refined_data = None
-        if extracted_text and extracted_text.strip():
-            refined_data = refine_content(extracted_text)
+        if learned_corrected_text and learned_corrected_text.strip():
+            refined_data = refine_content(learned_corrected_text)
             print(f"Refined data: {refined_data}")
         
         response_data = {
             "success": True,
             "original_text": extracted_text or "No text detected",
-            "text": extracted_text,  # Keep for backward compatibility
+            "learned_corrected_text": learned_corrected_text,
+            "applied_corrections": applied_corrections,
             "refined_data": refined_data,
+            "image_hash": image_hash,
+            "user_id": user_id,
             "message": "OCR processing completed successfully"
         }
         
-        print(f"Sending response: {response_data}")  # Debug print
+        print(f"Sending response: {response_data}")
         return jsonify(response_data)
     
     except Exception as error:
@@ -223,6 +231,75 @@ def process_ocr():
             "success": False,
             "error": str(error),
             "message": "OCR processing failed"
+        }), 500
+    
+
+@app.route('/submit-feedback', methods=['POST'])
+def submit_feedback():
+    """Handle user corrections and learn from them"""
+    try:
+        data = request.json
+        
+        if not data or 'original_text' not in data or 'corrected_text' not in data:
+            return jsonify({"error": "Missing required fields"}), 400
+        
+        original_text = data['original_text']
+        corrected_text = data['corrected_text']
+        user_id = data.get('user_id', 'anonymous')
+        image_hash = data.get('image_hash')
+        confidence_score = data.get('confidence_score')
+        
+        # Save the correction
+        success = save_user_correction(user_id, original_text, corrected_text, image_hash, confidence_score)
+        
+        if success:
+            # Update patterns (we'll implement this later)
+            # update_patterns(original_text, corrected_text, user_id)
+            
+            return jsonify({
+                "success": True,
+                "message": "Feedback saved successfully",
+                "learned": True
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "message": "Failed to save feedback"
+            }), 500
+        
+    except Exception as error:
+        print(f"Feedback error: {error}")
+        return jsonify({
+            "success": False,
+            "error": str(error)
+        }), 500
+
+@app.route('/get-user-stats', methods=['GET'])
+def get_user_stats():
+    """Get user correction statistics"""
+    try:
+        user_id = request.args.get('user_id', 'anonymous')
+        
+        if db is None:
+            return jsonify({"error": "Database not connected"}), 500
+        
+        # Count corrections
+        correction_count = db.corrections.count_documents({"user_id": user_id})
+        
+        # Count learned patterns
+        pattern_count = db.patterns.count_documents({"user_id": user_id})
+        
+        return jsonify({
+            "success": True,
+            "user_id": user_id,
+            "total_corrections": correction_count,
+            "learned_patterns": pattern_count
+        })
+        
+    except Exception as error:
+        return jsonify({
+            "success": False,
+            "error": str(error)
         }), 500
 
 @app.route('/test-azure', methods=['GET'])
@@ -264,10 +341,29 @@ def test_llm_connection():
             "error": str(error)
         }), 500
 
+
+# dtabase code we have to import this to another file (just for testing purpose)
+
+
+
+
 if __name__ == '__main__':
+
+    db_connected = initialize_database()
+    
+    if not db_connected:
+        print("⚠️  Warning: Running without database - corrections won't be saved")
+        print("💡 To fix this:")
+        print("   1. Install MongoDB: https://docs.mongodb.com/manual/installation/")
+        print("   2. Start MongoDB service")
+        print("   3. Restart this Flask app")
+
     # Check for required environment variables
     if not AZURE_ENDPOINT or not AZURE_KEY:
         print("Warning: Azure credentials not found in environment variables")
         print("Please set AZURE_ENDPOINT and AZURE_KEY in your .env file")
     
     app.run(debug=True, host='0.0.0.0', port=5000)
+
+
+

@@ -6,7 +6,7 @@ import './App.css';
 const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000';
 
 // API functions
-const processOCRWithBackend = async (imageDataUrl) => {
+const processOCRWithBackend = async (imageDataUrl, userId = 'anonymous') => {
   try {
     const response = await fetch(`${API_BASE_URL}/process-ocr`, {
       method: 'POST',
@@ -14,7 +14,8 @@ const processOCRWithBackend = async (imageDataUrl) => {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        image: imageDataUrl
+        image: imageDataUrl,
+        user_id: userId
       })
     });
 
@@ -57,6 +58,13 @@ const DrawingOCRApp = () => {
   const [backendStatus, setBackendStatus] = useState('checking');
   const [error, setError] = useState('');
   const [showCopiedAlert, setShowCopiedAlert] = useState(false);
+  // Add these to your useState declarations
+  const [userId, setUserId] = useState('');
+  const [showCorrectionInput, setShowCorrectionInput] = useState(false);
+  const [correctionText, setCorrectionText] = useState('');
+  const [currentImageHash, setCurrentImageHash] = useState('');
+  // Add this with your other useState declarations
+  const [textWasUpdated, setTextWasUpdated] = useState(false);
 
   // Check backend connection on component mount
   useEffect(() => {
@@ -66,6 +74,12 @@ const DrawingOCRApp = () => {
     };
     checkBackend();
   }, []);
+  // Add this useEffect to auto-populate correction field
+  useEffect(() => {
+  if (selectedText && showCorrectionInput) {
+    setCorrectionText(selectedText);
+  }
+}, [selectedText, showCorrectionInput]);
 
   // Touch event handlers for mobile
   const handleTouchStart = (e) => {
@@ -181,14 +195,16 @@ const DrawingOCRApp = () => {
     setError('');
     setOcrResults(null);
     setSelectedText('');
+    setCorrectionText(''); // Add this line
     
     try {
       const canvas = canvasRef.current;
       const imageDataUrl = canvas.toDataURL('image/png');
       
-      const result = await processOCRWithBackend(imageDataUrl);
+      const result = await processOCRWithBackend(imageDataUrl, userId || 'anonymous');
       console.log('OCR API Result:', result);
       setOcrResults(result);
+      setCurrentImageHash(result.image_hash || ''); // Add this line
       
       const originalText = result.original_text || result.text;
       if (originalText && originalText.trim()) {
@@ -221,6 +237,60 @@ const DrawingOCRApp = () => {
       });
     }
   };
+  
+  const submitCorrection = async () => {
+  if (!correctionText.trim() || correctionText === selectedText) {
+    return;
+  }
+  
+  try {
+    const response = await fetch(`${API_BASE_URL}/submit-feedback`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        original_text: selectedText,
+        corrected_text: correctionText.trim(),
+        user_id: userId || 'anonymous',
+        image_hash: currentImageHash,
+        confidence_score: ocrResults?.refined_data?.confidence
+      })
+    });
+
+    const result = await response.json();
+    
+    if (result.success) {
+      // ✅ UPDATE SELECTED TEXT TO USER'S CORRECTION
+      setSelectedText(correctionText.trim());
+      
+      // ✅ SHOW VISUAL FEEDBACK THAT TEXT WAS UPDATED
+      setTextWasUpdated(true);
+      setTimeout(() => setTextWasUpdated(false), 3000);
+      
+      // Show success message
+      setShowCopiedAlert(true);
+      setTimeout(() => setShowCopiedAlert(false), 3000);
+      
+      // Clear correction input
+      setCorrectionText('');
+      setShowCorrectionInput(false);
+      
+      // Fetch updated learning stats
+      // if (userId) {
+      //   fetchLearningStats();
+      // }
+      
+      console.log('✅ Correction submitted and selected text updated');
+    } else {
+      setError('Failed to submit correction: ' + result.error);
+    }
+    
+  } catch (error) {
+    console.error('Correction submission failed:', error);
+    setError('Failed to submit correction. Please try again.');
+  }
+};
 
   const downloadImage = () => {
     const canvas = canvasRef.current;
@@ -263,7 +333,25 @@ const DrawingOCRApp = () => {
             {getStatusIndicator()}
           </div>
         </header>
-
+        {/* User Management Section */}
+        <div className="user-section glass-effect">
+          <div className="section-header">
+            <h3 className="section-title">User Settings</h3>
+          </div>
+          <div className="user-controls">
+            <label>Your User ID (for personalized learning):</label>
+            <input
+              type="text"
+              value={userId}
+              onChange={(e) => setUserId(e.target.value)}
+              placeholder="Enter your name or ID"
+              className="user-input"
+            />
+            <p className="user-hint">
+              Using the same ID helps the system learn your handwriting patterns
+            </p>
+          </div>
+        </div>
         {/* Copied Alert */}
         {showCopiedAlert && (
           <div className="alert-popup">
@@ -426,8 +514,9 @@ const DrawingOCRApp = () => {
 
                 {/* Selected Text Display */}
                 {selectedText && (
-                  <div className="selected-text-display">
+                  <div className={`selected-text-display ${textWasUpdated ? 'text-updated' : ''}`}>
                     <h4>Selected Text:</h4>
+                     {textWasUpdated && <span className="update-indicator"> ✅ Updated!</span>}
                     <p>{selectedText}</p>
                   </div>
                 )}
@@ -448,13 +537,70 @@ const DrawingOCRApp = () => {
             )}
           </div>
         </div>
+        
+        {/* Correction Input Section */}
+          {ocrResults && selectedText && (
+            <div className="correction-section glass-effect">
+              <div className="section-header">
+                <h3 className="section-title">Help Improve Accuracy</h3>
+              </div>
+              
+              <div className="correction-container">
+                <p>Is the extracted text incorrect? Help us learn by providing the correct version:</p>
+                
+                <div className="text-comparison">
+                  <div className="text-box">
+                    <label>System Result:</label>
+                    <div className="readonly-text">{selectedText}</div>
+                  </div>
+                  
+                  <div className="text-box">
+                    <label>Correct Text:</label>
+                    <textarea
+                      value={correctionText}
+                      onChange={(e) => setCorrectionText(e.target.value)}
+                      placeholder="Type the correct text here..."
+                      className="correction-textarea"
+                      rows="3"
+                    />
+                  </div>
+                </div>
+                
+                <div className="correction-actions">
+                  <button
+                    onClick={submitCorrection}
+                    disabled={!correctionText.trim() || correctionText === selectedText}
+                    className="glow-button btn-success"
+                  >
+                    <CheckCircle size={16} />
+                    Submit Correction
+                  </button>
+                  
+                  <button
+                    onClick={() => {
+                      setCorrectionText('');
+                      setShowCorrectionInput(false);
+                    }}
+                    className="glow-button btn-secondary"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+
+
+
 
         {/* Footer */}
         <footer className="footer">
           <p>Powered by Azure Computer Vision API + AI Text Refinement</p>
         </footer>
       </div>
-    </div>
+
   );
 };
 
