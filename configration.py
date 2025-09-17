@@ -1,5 +1,5 @@
 from langchain_groq import ChatGroq
-from langchain.chat_models import ChatOpenAI
+# from langchain.chat_models import ChatOpenAI
 from dotenv import load_dotenv
 import os 
 
