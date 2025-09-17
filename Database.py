@@ -11,6 +11,8 @@ db = None
 
 # MongoDB configuration
 MONGO_URI = os.getenv("MONGO_URI")
+# MONGO_URI = os.getenv("MONGO_URI_CLOUD")
+
 DATABASE_NAME = os.getenv("DATABASE_NAME")
 
 
