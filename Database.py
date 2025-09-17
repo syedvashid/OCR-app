@@ -10,25 +10,22 @@ import os
 db = None
 
 # MongoDB configuration
-MONGO_URI = os.getenv("MONGO_URI")
-# MONGO_URI = os.getenv("MONGO_URI_CLOUD")
+# MONGO_URI = os.getenv("MONGO_URI")
+MONGO_URI = os.getenv("MONGO_URI_CLOUD")
 
 DATABASE_NAME = os.getenv("DATABASE_NAME")
 
 
 def initialize_database():
-    """Initialize MongoDB connection"""
     global db
     try:
-        mongo_client = MongoClient(MONGO_URI)
-        # Test connection
-        mongo_client.admin.command('ping')
+        mongo_client = MongoClient(MONGO_URI, tls=True, tlsAllowInvalidCertificates=True)
+        mongo_client.admin.command('ping')  # test connection
         db = mongo_client[DATABASE_NAME]
-        print("✅ MongoDB connected successfully")
+        print("✅ MongoDB connected successfully (Cosmos DB)")
         return True
     except Exception as e:
         print(f"❌ MongoDB connection failed: {e}")
-        print("💡 Make sure MongoDB is running on your system")
         db = None
         return False
 
