@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate
 from langchain.chains import LLMChain
 from langchain_core.messages import HumanMessage, SystemMessage
-from configration import llm, llm1
+from configration import  llm1
 from Database import save_user_correction, get_learned_patterns, apply_learned_corrections,create_image_hash, initialize_database, db
 
 # Load environment variables
