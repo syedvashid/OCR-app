@@ -106,4 +106,4 @@ def apply_learned_corrections(text, user_id=None):
     
 def create_image_hash(image_data):
     """Create hash for image data"""
-    return hashlib.md5(image_data).hexdigest()[:16] 
+    return hashlib.md5(image_data).hexdigest()[:16]  
