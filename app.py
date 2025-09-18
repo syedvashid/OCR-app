@@ -342,11 +342,27 @@ def test_llm_connection():
         }), 500
 
 
-# dtabase code we have to import this to another file (just for testing purpose)
+# using this in local and working fine
+# if __name__ == '__main__':
+
+#     db_connected = initialize_database()
+    
+#     if not db_connected:
+#         print("⚠️  Warning: Running without database - corrections won't be saved")
+#         print("💡 To fix this:")
+#         print("   1. Install MongoDB: https://docs.mongodb.com/manual/installation/")
+#         print("   2. Start MongoDB service")
+#         print("   3. Restart this Flask app")
+
+#     # Check for required environment variables
+#     if not AZURE_ENDPOINT or not AZURE_KEY:
+#         print("Warning: Azure credentials not found in environment variables")
+#         print("Please set AZURE_ENDPOINT and AZURE_KEY in your .env file")
+    
+#     app.run(debug=True, host='0.0.0.0', port=5000)
 
 
-
-
+# using this becouse not working on azure
 if __name__ == '__main__':
 
     db_connected = initialize_database()
@@ -363,7 +379,5 @@ if __name__ == '__main__':
         print("Warning: Azure credentials not found in environment variables")
         print("Please set AZURE_ENDPOINT and AZURE_KEY in your .env file")
     
-    app.run(debug=True, host='0.0.0.0', port=5000)
-
-
-
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=False, host="0.0.0.0", port=port)
