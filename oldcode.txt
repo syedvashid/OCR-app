@@ -1,0 +1,2051 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import requests
+import base64
+import time
+import os
+from dotenv import load_dotenv
+from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate
+from langchain.chains import LLMChain
+from langchain_core.messages import HumanMessage, SystemMessage
+from configration import  llm1
+from Database import save_user_correction, get_learned_patterns, apply_learned_corrections,create_image_hash, initialize_database, db
+
+# Load environment variables
+load_dotenv()
+
+app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
+
+# Azure OCR configuration
+AZURE_ENDPOINT = os.getenv('REACT_APP_AZURE_ENDPOINT')
+AZURE_KEY = os.getenv('REACT_APP_AZURE_KEY')
+
+def process_with_azure_ocr(image_data):
+    """Process image with Azure OCR API"""
+    try:
+        # Step 1: Send image for analysis
+        headers = {
+            "Ocp-Apim-Subscription-Key": AZURE_KEY,
+            "Content-Type": "application/octet-stream",
+        }
+        
+        response = requests.post(
+            f"{AZURE_ENDPOINT}/vision/v3.2/read/analyze",
+            headers=headers,
+            data=image_data
+        )
+        
+        if not response.ok:
+            raise Exception(f"Azure OCR request failed: {response.status_code}")
+        
+        # Get operation-location to poll results
+        operation_location = response.headers.get("operation-location")
+        print(f"Operation location: {operation_location}")
+        
+        if not operation_location:
+            raise Exception("No operation location returned from Azure")
+        
+        # Step 2: Poll until result is ready
+        poll_headers = {"Ocp-Apim-Subscription-Key": AZURE_KEY}
+        
+        while True:
+            poll_response = requests.get(operation_location, headers=poll_headers)
+            result = poll_response.json()
+            
+            if result.get("status") == "succeeded":
+                # Extract text from results
+                extracted_text = ""
+                if "analyzeResult" in result and "readResults" in result["analyzeResult"]:
+                    for page in result["analyzeResult"]["readResults"]:
+                        for line in page.get("lines", []):
+                            extracted_text += line.get("text", "") + " "
+                
+                return extracted_text.strip()
+            
+            elif result.get("status") == "failed":
+                raise Exception("OCR processing failed")
+            
+            # Wait before polling again
+            time.sleep(1)
+    
+    except Exception as error:
+        print(f"Azure OCR error: {error}")
+        raise Exception(f"OCR processing failed: {str(error)}")
+
+def refine_content(content):
+    """
+    This function takes the OCR content and uses LLM to refine and suggest better responses
+    """
+    try:
+        system_prompt = """
+        You are an OCR text correction specialist. Your task is to:
+        1. Analyze the given text for spelling mistakes and OCR errors
+        2. Provide exactly 3 refined versions of the text
+        3. Keep the same meaning and word count as much as possible
+        4. Only correct obvious spelling mistakes and OCR misreads
+        5. Do not add or remove content, just correct errors
+        6. Format must be exactly the same as i asked
+
+        Format your response as JSON:
+        {
+            "suggestions": [
+                "First corrected version",
+                "Second corrected version", 
+                "Third corrected version"
+            ],
+            "confidence": "high/medium/low"
+        }
+
+        Examples of corrections:
+        - "Tever" -> "Fever"
+        - "hpadache" -> "headache" 
+        - "medcine" -> "medicine"
+        - "payn" -> "pain"
+
+
+       Format must be exactly the same as i asked
+        """
+        
+        human_prompt = f"""
+        Please analyze and correct this OCR text: "{content}"
+        
+        Provide 3 refined versions that correct spelling mistakes while preserving the original meaning.
+        """
+        
+        response = llm1.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=human_prompt)
+        ])
+        
+        # Try to parse JSON response
+        import json
+        try:
+            # Clean the response content
+            content = response.content.strip()
+            if content.startswith('```json'):
+                content = content.replace('```json', '').replace('```', '').strip()
+            
+            refined_data = json.loads(content)
+            
+            # Ensure we have the right structure
+            if 'suggestions' not in refined_data:
+                refined_data = {
+                    "suggestions": [content.strip(), content.strip(), content.strip()],
+                    "confidence": "low"
+                }
+            
+            return refined_data
+            
+        except Exception as parse_error:
+            print(f"JSON parsing failed: {parse_error}")
+            print(f"Raw LLM response: {response.content}")
+            
+            # Extract suggestions manually if JSON parsing fails
+            lines = response.content.strip().split('\n')
+            suggestions = []
+            for line in lines:
+                if line.strip() and not line.startswith('{') and not line.startswith('}'):
+                    clean_line = line.strip().strip('"').strip(',').strip()
+                    if clean_line and not clean_line.startswith('"suggestions"'):
+                        suggestions.append(clean_line)
+            
+            if len(suggestions) < 3:
+                suggestions = [content.strip(), content.strip(), content.strip()]
+            
+            return {
+                "suggestions": suggestions[:3],
+                "confidence": "medium"
+            }
+            
+    except Exception as e:
+        print(f"Error in refine_content: {e}")
+        # Return original content as fallback
+        return {
+            "suggestions": [content.strip(), content.strip(), content.strip()],
+            "confidence": "low",
+            "error": str(e)
+        }
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({"status": "healthy", "message": "OCR API is running"})
+
+@app.route('/process-ocr', methods=['POST'])
+def process_ocr():
+    """
+    Process OCR request with learning integration
+    """
+    try:
+        # Check if request has JSON data
+        if not request.json or 'image' not in request.json:
+            return jsonify({"error": "No image data provided"}), 400
+        
+        # Get base64 image data and user ID
+        image_base64 = request.json['image']
+        user_id = request.json.get('user_id', 'anonymous')
+        
+        # Remove data URL prefix if present
+        if ',' in image_base64:
+            image_base64 = image_base64.split(',')[1]
+        
+        # Decode base64 to binary data
+        try:
+            image_data = base64.b64decode(image_base64)
+            image_hash = create_image_hash(image_data)
+        except Exception as e:
+            return jsonify({"error": "Invalid base64 image data"}), 400
+        
+        # Process with Azure OCR
+        extracted_text = process_with_azure_ocr(image_data)
+        print(f"Extracted text: {extracted_text}")
+        
+        # Apply learned corrections BEFORE LLM processing
+        learned_corrected_text, applied_corrections = apply_learned_corrections(extracted_text, user_id)
+        print(f"Applied corrections: {applied_corrections}")
+        
+        # Refine content with LLM using the learned-corrected text
+        refined_data = None
+        if learned_corrected_text and learned_corrected_text.strip():
+            refined_data = refine_content(learned_corrected_text)
+            print(f"Refined data: {refined_data}")
+        
+        response_data = {
+            "success": True,
+            "original_text": extracted_text or "No text detected",
+            "learned_corrected_text": learned_corrected_text,
+            "applied_corrections": applied_corrections,
+            "refined_data": refined_data,
+            "image_hash": image_hash,
+            "user_id": user_id,
+            "message": "OCR processing completed successfully"
+        }
+        
+        print(f"Sending response: {response_data}")
+        return jsonify(response_data)
+    
+    except Exception as error:
+        print(f"OCR processing error: {error}")
+        return jsonify({
+            "success": False,
+            "error": str(error),
+            "message": "OCR processing failed"
+        }), 500
+    
+
+@app.route('/submit-feedback', methods=['POST'])
+def submit_feedback():
+    """Handle user corrections and learn from them"""
+    try:
+        data = request.json
+        
+        if not data or 'original_text' not in data or 'corrected_text' not in data:
+            return jsonify({"error": "Missing required fields"}), 400
+        
+        original_text = data['original_text']
+        corrected_text = data['corrected_text']
+        user_id = data.get('user_id', 'anonymous')
+        image_hash = data.get('image_hash')
+        confidence_score = data.get('confidence_score')
+        
+        # Save the correction
+        success = save_user_correction(user_id, original_text, corrected_text, image_hash, confidence_score)
+        
+        if success:
+            # Update patterns (we'll implement this later)
+            # update_patterns(original_text, corrected_text, user_id)
+            
+            return jsonify({
+                "success": True,
+                "message": "Feedback saved successfully",
+                "learned": True
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "message": "Failed to save feedback"
+            }), 500
+        
+    except Exception as error:
+        print(f"Feedback error: {error}")
+        return jsonify({
+            "success": False,
+            "error": str(error)
+        }), 500
+
+@app.route('/get-user-stats', methods=['GET'])
+def get_user_stats():
+    """Get user correction statistics"""
+    try:
+        user_id = request.args.get('user_id', 'anonymous')
+        
+        if db is None:
+            return jsonify({"error": "Database not connected"}), 500
+        
+        # Count corrections
+        correction_count = db.corrections.count_documents({"user_id": user_id})
+        
+        # Count learned patterns
+        pattern_count = db.patterns.count_documents({"user_id": user_id})
+        
+        return jsonify({
+            "success": True,
+            "user_id": user_id,
+            "total_corrections": correction_count,
+            "learned_patterns": pattern_count
+        })
+        
+    except Exception as error:
+        return jsonify({
+            "success": False,
+            "error": str(error)
+        }), 500
+
+@app.route('/test-azure', methods=['GET'])
+def test_azure_connection():
+    """Test Azure API connection"""
+    try:
+        if not AZURE_ENDPOINT or not AZURE_KEY:
+            return jsonify({
+                "success": False,
+                "message": "Azure credentials not configured"
+            }), 500
+        
+        return jsonify({
+            "success": True,
+            "message": "Azure credentials are configured",
+            "endpoint_configured": bool(AZURE_ENDPOINT),
+            "key_configured": bool(AZURE_KEY)
+        })
+    
+    except Exception as error:
+        return jsonify({
+            "success": False,
+            "error": str(error)
+        }), 500
+
+@app.route('/test-llm', methods=['GET'])
+def test_llm_connection():
+    """Test LLM connection"""
+    try:
+        test_response = refine_content("test message")
+        return jsonify({
+            "success": True,
+            "message": "LLM is working",
+            "test_response": test_response
+        })
+    except Exception as error:
+        return jsonify({
+            "success": False,
+            "error": str(error)
+        }), 500
+
+
+# using this in local and working fine
+if __name__ == '__main__':
+
+    db_connected = initialize_database()
+    
+    if not db_connected:
+        print("⚠️  Warning: Running without database - corrections won't be saved")
+        print("💡 To fix this:")
+        print("   1. Install MongoDB: https://docs.mongodb.com/manual/installation/")
+        print("   2. Start MongoDB service")
+        print("   3. Restart this Flask app")
+
+    # Check for required environment variables
+    if not AZURE_ENDPOINT or not AZURE_KEY:
+        print("Warning: Azure credentials not found in environment variables")
+        print("Please set AZURE_ENDPOINT and AZURE_KEY in your .env file")
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
+
+
+# using this becouse not working on azure. use this for azure
+# if __name__ == '__main__':
+
+#     db_connected = initialize_database()
+    
+#     if not db_connected:
+#         print("⚠️  Warning: Running without database - corrections won't be saved")
+#         print("💡 To fix this:")
+#         print("   1. Install MongoDB: https://docs.mongodb.com/manual/installation/")
+#         print("   2. Start MongoDB service")
+#         print("   3. Restart this Flask app")
+
+#     # Check for required environment variables
+#     if not AZURE_ENDPOINT or not AZURE_KEY:
+#         print("Warning: Azure credentials not found in environment variables")
+#         print("Please set AZURE_ENDPOINT and AZURE_KEY in your .env file")
+    
+#     port = int(os.environ.get("PORT", 5000))
+#     app.run(debug=False, host="0.0.0.0", port=port)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+----------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#----------------------------this js code is code without the upload image option direct take input from canvas and extract the text --------------
+
+
+
+
+
+
+import React, { useState, useRef, useEffect } from 'react';
+import { Pen, Eraser, Download, Camera, Trash2, Loader, AlertCircle, CheckCircle, Copy } from 'lucide-react';
+import './App.css';
+
+// Backend API configuration
+// 'https://ocr-app-backend-dnegbva9b7g5h6d4.centralindia-01.azurewebsites.net'  put this in line 7 link
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+
+// API functions
+const processOCRWithBackend = async (imageDataUrl, userId = 'anonymous') => {
+  try {
+    const response = await fetch(`${API_BASE_URL}/process-ocr`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        image: imageDataUrl,
+        user_id: userId
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const result = await response.json();
+    
+    if (!result.success) {
+      throw new Error(result.error || 'OCR processing failed');
+    }
+
+    return result;
+  } catch (error) {
+    console.error('OCR API error:', error);
+    throw new Error(`OCR processing failed: ${error.message}`);
+  }
+};
+
+const testBackendConnection = async () => {
+  try {
+    const response = await fetch(`${API_BASE_URL}/health`);
+    return response.ok;
+  } catch (error) {
+    console.error('Backend connection test failed:', error);
+    return false;
+  }
+};
+
+const DrawingOCRApp = () => {
+  const canvasRef = useRef(null);
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [currentPath, setCurrentPath] = useState([]);
+  const [paths, setPaths] = useState([]);
+  const [brushSize, setBrushSize] = useState(3);
+  const [ocrResults, setOcrResults] = useState(null);
+  const [selectedText, setSelectedText] = useState('');
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [backendStatus, setBackendStatus] = useState('checking');
+  const [error, setError] = useState('');
+  const [showCopiedAlert, setShowCopiedAlert] = useState(false);
+  // Add these to your useState declarations
+  const [userId, setUserId] = useState('');
+  const [showCorrectionInput, setShowCorrectionInput] = useState(false);
+  const [correctionText, setCorrectionText] = useState('');
+  const [currentImageHash, setCurrentImageHash] = useState('');
+  // Add this with your other useState declarations
+  const [textWasUpdated, setTextWasUpdated] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
+  // for pen and eraser tool
+  const [tool, setTool] = useState('pen'); // 'pen' or 'eraser'
+  const [eraserSize, setEraserSize] = useState(10);
+
+  // Check backend connection on component mount
+  useEffect(() => {
+    const checkBackend = async () => {
+      const isConnected = await testBackendConnection();
+      setBackendStatus(isConnected ? 'connected' : 'disconnected');
+    };
+    checkBackend();
+  }, []);
+  // Add this useEffect to auto-populate correction field
+  useEffect(() => {
+  if (selectedText && showCorrectionInput) {
+    setCorrectionText(selectedText);
+  }
+}, [selectedText, showCorrectionInput]);
+
+// Replace your mobile detection useEffect with these two:
+useEffect(() => {
+  const checkIfMobile = () => {
+    const userAgent = navigator.userAgent || navigator.vendor || window.opera;
+    const mobileRegex = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i;
+    setIsMobile(mobileRegex.test(userAgent.toLowerCase()));
+  };
+  
+  checkIfMobile();
+}, []);
+
+useEffect(() => {
+  if (isMobile && brushSize === 3) {
+    setBrushSize(6);
+  }
+}, [isMobile, brushSize]);
+
+  // Touch event handlers for mobile
+  const handleTouchStart = (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  
+  const touch = e.touches[0];
+  const canvas = canvasRef.current;
+  const rect = canvas.getBoundingClientRect();
+  
+  // Better coordinate calculation considering canvas scaling
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  
+  const x = (touch.clientX - rect.left) * scaleX;
+  const y = (touch.clientY - rect.top) * scaleY;
+  
+  setIsDrawing(true);
+  setCurrentPath([{ x, y, tool, size: tool === 'pen' ? brushSize : eraserSize }]);
+};
+
+const handleTouchMove = (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  
+  if (!isDrawing) return;
+  
+  const touch = e.touches[0];
+  const canvas = canvasRef.current;
+  const rect = canvas.getBoundingClientRect();
+  
+  // Better coordinate calculation considering canvas scaling
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  
+  const x = (touch.clientX - rect.left) * scaleX;
+  const y = (touch.clientY - rect.top) * scaleY;
+  
+  setCurrentPath(prev => [...prev, { x, y, tool, size: tool === 'pen' ? brushSize : eraserSize }]);
+};
+
+const handleTouchEnd = (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  
+  if (isDrawing && currentPath.length > 0) {
+    setPaths(prev => [...prev, currentPath]);
+    setCurrentPath([]);
+  }
+  setIsDrawing(false);
+};
+
+  // Drawing functions
+  const startDrawing = (e) => {
+  const canvas = canvasRef.current;
+  const rect = canvas.getBoundingClientRect();
+  
+  // Better coordinate calculation
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  
+  const x = (e.clientX - rect.left) * scaleX;
+  const y = (e.clientY - rect.top) * scaleY;
+  
+  setIsDrawing(true);
+  setCurrentPath([{ x, y, tool, size: tool === 'pen' ? brushSize : eraserSize }]);
+};
+
+const draw = (e) => {
+  if (!isDrawing) return;
+  
+  const canvas = canvasRef.current;
+  const rect = canvas.getBoundingClientRect();
+  
+  // Better coordinate calculation
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  
+  const x = (e.clientX - rect.left) * scaleX;
+  const y = (e.clientY - rect.top) * scaleY;
+  
+  setCurrentPath(prev => [...prev, { x, y, tool, size: tool === 'pen' ? brushSize : eraserSize }]);
+};
+
+  const stopDrawing = () => {
+    if (isDrawing && currentPath.length > 0) {
+      setPaths(prev => [...prev, currentPath]);
+      setCurrentPath([]);
+    }
+    setIsDrawing(false);
+  };
+
+const clearCanvas = () => {
+  setPaths([]);
+  setCurrentPath([]);
+  setOcrResults(null);
+  setSelectedText('');
+  setError('');
+  
+  // Also clear the canvas visually
+  const canvas = canvasRef.current;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = 'white';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+};
+
+  const undoLastStroke = () => {
+    setPaths(prev => prev.slice(0, -1));
+  };
+
+  // Tool switching functions
+const switchToPen = () => {
+  setTool('pen');
+};
+
+const switchToEraser = () => {
+  setTool('eraser');
+};
+
+  // Canvas drawing effect
+useEffect(() => {
+  const canvas = canvasRef.current;
+  const ctx = canvas.getContext('2d');
+  
+  // Clear canvas with white background
+  ctx.fillStyle = 'white';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  
+  // Draw all paths
+  [...paths, currentPath].forEach(path => {
+    if (path.length > 1) {
+      const pathTool = path[0]?.tool || 'pen';
+      const pathSize = path[0]?.size || brushSize;
+      
+      ctx.beginPath();
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = pathSize;
+      
+      if (pathTool === 'eraser') {
+        // Eraser mode - use destination-out composite operation
+        ctx.globalCompositeOperation = 'destination-out';
+      } else {
+        // Pen mode - normal drawing
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.strokeStyle = '#000';
+      }
+      
+      ctx.moveTo(path[0].x, path[0].y);
+      path.forEach(point => ctx.lineTo(point.x, point.y));
+      ctx.stroke();
+    }
+  });
+  
+  // Reset to normal composite operation
+  ctx.globalCompositeOperation = 'source-over';
+}, [paths, currentPath, brushSize, eraserSize, tool, isMobile]);
+
+  // OCR Processing
+  const processOCR = async () => {
+    if (paths.length === 0) {
+      setError("Please draw something first!");
+      return;
+    }
+
+    if (backendStatus !== 'connected') {
+      setError("Backend server is not connected. Please make sure the Flask server is running.");
+      return;
+    }
+
+    setIsProcessing(true);
+    setError('');
+    setOcrResults(null);
+    setSelectedText('');
+    setCorrectionText(''); // Add this line
+    
+    try {
+      const canvas = canvasRef.current;
+      const imageDataUrl = canvas.toDataURL('image/png');
+      
+      const result = await processOCRWithBackend(imageDataUrl, userId || 'anonymous');
+      console.log('OCR API Result:', result);
+      setOcrResults(result);
+      setCurrentImageHash(result.image_hash || ''); // Add this line
+      
+      const originalText = result.original_text || result.text;
+      if (originalText && originalText.trim()) {
+        setSelectedText(originalText);
+      } else {
+        if (result.refined_data?.suggestions?.length > 0) {
+          setSelectedText(result.refined_data.suggestions[0]);
+        }
+      }
+      
+    } catch (error) {
+      console.error("OCR processing failed:", error);
+      setError(error.message || "Processing failed. Please try again.");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const selectText = (text) => {
+    setSelectedText(text);
+  };
+
+  const copyToClipboard = () => {
+    if (selectedText) {
+      navigator.clipboard.writeText(selectedText).then(() => {
+        setShowCopiedAlert(true);
+        setTimeout(() => setShowCopiedAlert(false), 2000);
+      }).catch(() => {
+        setError("Failed to copy to clipboard");
+      });
+    }
+  };
+  
+  const submitCorrection = async () => {
+  if (!correctionText.trim() || correctionText === selectedText) {
+    return;
+  }
+  
+  try {
+    const response = await fetch(`${API_BASE_URL}/submit-feedback`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        original_text: selectedText,
+        corrected_text: correctionText.trim(),
+        user_id: userId || 'anonymous',
+        image_hash: currentImageHash,
+        confidence_score: ocrResults?.refined_data?.confidence
+      })
+    });
+
+    const result = await response.json();
+    
+    if (result.success) {
+      // ✅ UPDATE SELECTED TEXT TO USER'S CORRECTION
+      setSelectedText(correctionText.trim());
+      
+      // ✅ SHOW VISUAL FEEDBACK THAT TEXT WAS UPDATED
+      setTextWasUpdated(true);
+      setTimeout(() => setTextWasUpdated(false), 3000);
+      
+      // Show success message
+      setShowCopiedAlert(true);
+      setTimeout(() => setShowCopiedAlert(false), 3000);
+      
+      // Clear correction input
+      setCorrectionText('');
+      setShowCorrectionInput(false);
+      
+      // Fetch updated learning stats
+      // if (userId) {
+      //   fetchLearningStats();
+      // }
+      
+      console.log('✅ Correction submitted and selected text updated');
+    } else {
+      setError('Failed to submit correction: ' + result.error);
+    }
+    
+  } catch (error) {
+    console.error('Correction submission failed:', error);
+    setError('Failed to submit correction. Please try again.');
+  }
+};
+
+  const downloadImage = () => {
+    const canvas = canvasRef.current;
+    const link = document.createElement('a');
+    link.download = `drawing_${Date.now()}.png`;
+    link.href = canvas.toDataURL();
+    link.click();
+  };
+
+  const getStatusIndicator = () => {
+    switch (backendStatus) {
+      case 'checking':
+        return <span className="status-checking">🔄 Checking connection...</span>;
+      case 'connected':
+        return <span className="status-connected">✅ Backend connected</span>;
+      case 'disconnected':
+        return <span className="status-disconnected">❌ Backend disconnected</span>;
+      default:
+        return null;
+    }
+  };
+
+  const getConfidenceBadge = (confidence) => {
+    return `badge badge-${confidence}`;
+  };
+
+  return (
+    <div className="app-container animate-fade-in">
+      {/* Floating background orbs */}
+      <div className="floating-orb orb-1"></div>
+      <div className="floating-orb orb-2"></div>
+      <div className="floating-orb orb-3"></div>
+
+      <div className="content-wrapper">
+        {/* Header */}
+        <header className="header-section">
+          <h1 className="gradient-text main-title">AI-Enhanced Drawing OCR</h1>
+          <p className="subtitle">Draw or write text, and our AI will extract and refine it!</p>
+          <div className="status-indicator">
+            {getStatusIndicator()}
+          </div>
+        </header>
+        {/* User Management Section */}
+        <div className="user-section glass-effect">
+          <div className="section-header">
+            <h3 className="section-title">User Settings</h3>
+          </div>
+          <div className="user-controls">
+            <label>Your User ID (for personalized learning):</label>
+            <input
+              type="text"
+              value={userId}
+              onChange={(e) => setUserId(e.target.value)}
+              placeholder="Enter your name or ID"
+              className="user-input"
+            />
+            <p className="user-hint">
+              Using the same ID helps the system learn your handwriting patterns
+            </p>
+          </div>
+        </div>
+        {/* Copied Alert */}
+        {showCopiedAlert && (
+          <div className="alert-popup">
+            <CheckCircle size={16} />
+            Copied to clipboard!
+          </div>
+        )}
+
+        <div className="main-content">
+          {/* Drawing Pad */}
+          <div className="drawing-section glass-effect">
+            <div className="section-header">
+              <h2 className="section-title">Drawing Pad</h2>
+              
+              {/* Tool Selection */}
+              <div className="tool-controls">
+                <div className="tool-buttons">
+                  <button
+                    onClick={switchToPen}
+                    className={`tool-button ${tool === 'pen' ? 'active-tool' : ''}`}
+                    title="Pen Tool"
+                  >
+                    <Pen size={16} />
+                    Pen
+                  </button>
+                  <button
+                    onClick={switchToEraser}
+                    className={`tool-button ${tool === 'eraser' ? 'active-tool' : ''}`}
+                    title="Eraser Tool"
+                  >
+                    <Eraser size={16} />
+                    Eraser
+                  </button>
+                </div>
+                
+                {/* Dynamic Size Control */}
+                <div className="size-controls">
+                  <label>
+                    {tool === 'pen' ? 'Brush' : 'Eraser'} Size:
+                  </label>
+                  <input
+                    type="range"
+                    min={tool === 'pen' ? (isMobile ? 3 : 1) : 5}
+                    max={tool === 'pen' ? (isMobile ? 15 : 10) : 30}
+                    value={tool === 'pen' ? brushSize : eraserSize}
+                    onChange={(e) => {
+                      const size = Number(e.target.value);
+                      if (tool === 'pen') {
+                        setBrushSize(size);
+                      } else {
+                        setEraserSize(size);
+                      }
+                    }}
+                    className="size-slider"
+                  />
+                  <span>
+                    {tool === 'pen' ? brushSize : eraserSize}px 
+                    {isMobile && tool === 'pen' && ' (Mobile Optimized)'}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Canvas */}
+            <div className="canvas-container">
+              <canvas
+                ref={canvasRef}
+                width={1000}
+                height={600}
+                className={`drawing-canvas ${tool === 'eraser' ? 'eraser-cursor' : 'pen-cursor'}`}
+                style={{
+                  touchAction: 'none',
+                  userSelect: 'none',
+                  WebkitUserSelect: 'none',
+                  WebkitTouchCallout: 'none',
+                  WebkitTapHighlightColor: 'transparent'
+                }}
+                onMouseDown={startDrawing}
+                onMouseMove={draw}
+                onMouseUp={stopDrawing}
+                onMouseLeave={stopDrawing}
+                onTouchStart={handleTouchStart}
+                onTouchMove={handleTouchMove}
+                onTouchEnd={handleTouchEnd}
+                onTouchCancel={handleTouchEnd}
+                onContextMenu={(e) => e.preventDefault()}
+              />
+            </div>
+            {/* Tool indicator for mobile */}
+              {isMobile && (
+                <div className="mobile-tool-indicator">
+                  <span className={`tool-indicator ${tool}`}>
+                    {tool === 'pen' ? '✏️ Drawing Mode' : '🧹 Eraser Mode'}
+                  </span>
+                </div>
+              )}
+
+            {/* Drawing Controls */} 
+            <div className="controls-panel">
+              <button
+                onClick={undoLastStroke}
+                className="glow-button btn-warning"
+                disabled={paths.length === 0}
+              >
+                <Eraser size={16} />
+                Undo
+              </button>
+              
+              <button
+                onClick={clearCanvas}
+                className="glow-button btn-danger"
+              >
+                <Trash2 size={16} />
+                Clear
+              </button>
+              
+              <button
+                onClick={downloadImage}
+                className="glow-button btn-info"
+                disabled={paths.length === 0}
+              >
+                <Download size={16} />
+                Download
+              </button>
+              
+              <button
+                onClick={processOCR}
+                disabled={isProcessing || paths.length === 0 || backendStatus !== 'connected'}
+                className={`glow-button btn-success ${isProcessing ? 'processing-pulse' : ''}`}
+              >
+                {isProcessing ? <Loader className="animate-spin" size={16} /> : <Camera size={16} />}
+                {isProcessing ? 'Processing...' : 'Extract Text'}
+              </button>
+            </div>
+          </div>
+
+          {/* Results Panel */}
+          <div className="results-section glass-effect">
+            <div className="section-header">
+              <h2 className="section-title">AI Text Detection</h2>
+              {selectedText && (
+                <button
+                  onClick={copyToClipboard}
+                  className="copy-button"
+                  title="Copy selected text"
+                >
+                  <Copy size={14} />
+                  Copy
+                </button>
+              )}
+            </div>
+
+            {/* Error Display */}
+            {error && (
+              <div className="error-message">
+                <AlertCircle size={16} />
+                <p>{error}</p>
+              </div>
+            )}
+
+            {/* Processing State */}
+            {isProcessing && (
+              <div className="processing-state">
+                <div className="processing-spinner">
+                  <Loader className="animate-spin" size={24} />
+                </div>
+                <span>AI is analyzing your drawing...</span>
+              </div>
+            )}
+
+            {/* Results Display */}
+            {ocrResults && !isProcessing && (
+              <div className="results-display custom-scrollbar">
+                {/* Original OCR Text */}
+                <div className="text-option-group">
+                  <h3 className="option-title">
+                    Original OCR Text
+                    <span className="badge badge-original">Original</span>
+                  </h3>
+                  <button
+                    onClick={() => selectText(ocrResults.original_text)}
+                    className={`text-option ${selectedText === ocrResults.original_text ? 'selected-original' : ''}`}
+                  >
+                    <p>{ocrResults.original_text || 'No text detected'}</p>
+                  </button>
+                </div>
+
+                {/* AI Refined Suggestions */}
+                {ocrResults.refined_data?.suggestions && (
+                  <div className="text-option-group">
+                    <h3 className="option-title">
+                      AI Refined Suggestions
+                      <span className={getConfidenceBadge(ocrResults.refined_data.confidence)}>
+                        {ocrResults.refined_data.confidence} confidence
+                      </span>
+                    </h3>
+                    <div className="suggestions-list">
+                      {ocrResults.refined_data.suggestions.map((suggestion, index) => (
+                        <button
+                          key={index}
+                          onClick={() => selectText(suggestion)}
+                          className={`text-option ${selectedText === suggestion ? 'selected-refined' : ''}`}
+                        >
+                          <div className="suggestion-content">
+                            <p>{suggestion}</p>
+                            <span className="option-number">Option {index + 1}</span>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Selected Text Display */}
+                {selectedText && (
+                  <div className={`selected-text-display ${textWasUpdated ? 'text-updated' : ''}`}>
+                    <h4>Selected Text:</h4>
+                     {textWasUpdated && <span className="update-indicator"> ✅ Updated!</span>}
+                    <p>{selectedText}</p>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Instructions */}
+            {!ocrResults && !isProcessing && !error && (
+              <div className="instructions">
+                <Pen className="instruction-icon animate-float" size={32} />
+                <p>Draw or write something on the canvas, then click "Extract Text" to see our AI analyze and refine your text!</p>
+                {backendStatus !== 'connected' && (
+                  <p className="backend-warning">
+                    Make sure the Flask backend server is running on port 5000
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+        
+        {/* Correction Input Section */}
+          {ocrResults && selectedText && (
+            <div className="correction-section glass-effect">
+              <div className="section-header">
+                <h3 className="section-title">Help Improve Accuracy</h3>
+              </div>
+              
+              <div className="correction-container">
+                <p>Is the extracted text incorrect? Help us learn by providing the correct version:</p>
+                
+                <div className="text-comparison">
+                  <div className="text-box">
+                    <label>System Result:</label>
+                    <div className="readonly-text">{selectedText}</div>
+                  </div>
+                  
+                  <div className="text-box">
+                    <label>Correct Text:</label>
+                    <textarea
+                      value={correctionText}
+                      onChange={(e) => setCorrectionText(e.target.value)}
+                      placeholder="Type the correct text here..."
+                      className="correction-textarea"
+                      rows="3"
+                    />
+                  </div>
+                </div>
+                
+                <div className="correction-actions">
+                  <button
+                    onClick={submitCorrection}
+                    disabled={!correctionText.trim() || correctionText === selectedText}
+                    className="glow-button btn-success"
+                  >
+                    <CheckCircle size={16} />
+                    Submit Correction
+                  </button>
+                  
+                  <button
+                    onClick={() => {
+                      setCorrectionText('');
+                      setShowCorrectionInput(false);
+                    }}
+                    className="glow-button btn-secondary"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+
+
+
+
+        {/* Footer */}
+        <footer className="footer">
+          <p>Powered by Azure Computer Vision API + AI Text Refinement</p>
+        </footer>
+      </div>
+
+  );
+};
+
+export default DrawingOCRApp;
+
+
+
+
+
+
+
+
+---------------------------------------------New code with img upolad option--------------------------------------------------
+
+
+
+import React, { useState, useRef, useEffect } from 'react';
+import { Pen, Eraser, Download, Camera, Trash2, Loader, AlertCircle, CheckCircle, Copy } from 'lucide-react';
+import './App.css';
+
+// Backend API configuration
+// 'https://ocr-app-backend-dnegbva9b7g5h6d4.centralindia-01.azurewebsites.net'  put this in line 7 link
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+
+// API functions
+const processOCRWithBackend = async (imageDataUrl, userId = 'anonymous') => {
+  try {
+    const response = await fetch(`${API_BASE_URL}/process-ocr`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        image: imageDataUrl,
+        user_id: userId
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const result = await response.json();
+    
+    if (!result.success) {
+      throw new Error(result.error || 'OCR processing failed');
+    }
+
+    return result;
+  } catch (error) {
+    console.error('OCR API error:', error);
+    throw new Error(`OCR processing failed: ${error.message}`);
+  }
+};
+
+const testBackendConnection = async () => {
+  try {
+    const response = await fetch(`${API_BASE_URL}/health`);
+    return response.ok;
+  } catch (error) {
+    console.error('Backend connection test failed:', error);
+    return false;
+  }
+};
+
+const DrawingOCRApp = () => {
+  const canvasRef = useRef(null);
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [currentPath, setCurrentPath] = useState([]);
+  const [paths, setPaths] = useState([]);
+  const [brushSize, setBrushSize] = useState(3);
+  const [ocrResults, setOcrResults] = useState(null);
+  const [selectedText, setSelectedText] = useState('');
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [backendStatus, setBackendStatus] = useState('checking');
+  const [error, setError] = useState('');
+  const [showCopiedAlert, setShowCopiedAlert] = useState(false);
+  // Add these to your useState declarations
+  const [userId, setUserId] = useState('');
+  const [showCorrectionInput, setShowCorrectionInput] = useState(false);
+  const [correctionText, setCorrectionText] = useState('');
+  const [currentImageHash, setCurrentImageHash] = useState('');
+  // Add this with your other useState declarations
+  const [textWasUpdated, setTextWasUpdated] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
+  // for pen and eraser tool
+  const [tool, setTool] = useState('pen'); // 'pen' or 'eraser'
+  const [eraserSize, setEraserSize] = useState(10);
+  const [uploadedImage, setUploadedImage] = useState(null);
+  const [processingMode, setProcessingMode] = useState('drawing'); // 'drawing' or 'upload'
+  const [previewImage, setPreviewImage] = useState(null);
+
+  // Check backend connection on component mount
+  useEffect(() => {
+    const checkBackend = async () => {
+      const isConnected = await testBackendConnection();
+      setBackendStatus(isConnected ? 'connected' : 'disconnected');
+    };
+    checkBackend();
+  }, []);
+  // Add this useEffect to auto-populate correction field
+  useEffect(() => {
+  if (selectedText && showCorrectionInput) {
+    setCorrectionText(selectedText);
+  }
+}, [selectedText, showCorrectionInput]);
+
+// Replace your mobile detection useEffect with these two:
+useEffect(() => {
+  const checkIfMobile = () => {
+    const userAgent = navigator.userAgent || navigator.vendor || window.opera;
+    const mobileRegex = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i;
+    setIsMobile(mobileRegex.test(userAgent.toLowerCase()));
+  };
+  
+  checkIfMobile();
+}, []);
+
+useEffect(() => {
+  if (isMobile && brushSize === 3) {
+    setBrushSize(6);
+  }
+}, [isMobile, brushSize]);
+
+  // Touch event handlers for mobile
+  const handleTouchStart = (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  
+  const touch = e.touches[0];
+  const canvas = canvasRef.current;
+  const rect = canvas.getBoundingClientRect();
+  
+  // Better coordinate calculation considering canvas scaling
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  
+  const x = (touch.clientX - rect.left) * scaleX;
+  const y = (touch.clientY - rect.top) * scaleY;
+  
+  setIsDrawing(true);
+  setCurrentPath([{ x, y, tool, size: tool === 'pen' ? brushSize : eraserSize }]);
+};
+
+const handleTouchMove = (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  
+  if (!isDrawing) return;
+  
+  const touch = e.touches[0];
+  const canvas = canvasRef.current;
+  const rect = canvas.getBoundingClientRect();
+  
+  // Better coordinate calculation considering canvas scaling
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  
+  const x = (touch.clientX - rect.left) * scaleX;
+  const y = (touch.clientY - rect.top) * scaleY;
+  
+  setCurrentPath(prev => [...prev, { x, y, tool, size: tool === 'pen' ? brushSize : eraserSize }]);
+};
+
+const handleTouchEnd = (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  
+  if (isDrawing && currentPath.length > 0) {
+    setPaths(prev => [...prev, currentPath]);
+    setCurrentPath([]);
+  }
+  setIsDrawing(false);
+};
+
+  // Drawing functions
+  const startDrawing = (e) => {
+  const canvas = canvasRef.current;
+  const rect = canvas.getBoundingClientRect();
+  
+  // Better coordinate calculation
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  
+  const x = (e.clientX - rect.left) * scaleX;
+  const y = (e.clientY - rect.top) * scaleY;
+  
+  setIsDrawing(true);
+  setCurrentPath([{ x, y, tool, size: tool === 'pen' ? brushSize : eraserSize }]);
+};
+
+const draw = (e) => {
+  if (!isDrawing) return;
+  
+  const canvas = canvasRef.current;
+  const rect = canvas.getBoundingClientRect();
+  
+  // Better coordinate calculation
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  
+  const x = (e.clientX - rect.left) * scaleX;
+  const y = (e.clientY - rect.top) * scaleY;
+  
+  setCurrentPath(prev => [...prev, { x, y, tool, size: tool === 'pen' ? brushSize : eraserSize }]);
+};
+
+  const stopDrawing = () => {
+    if (isDrawing && currentPath.length > 0) {
+      setPaths(prev => [...prev, currentPath]);
+      setCurrentPath([]);
+    }
+    setIsDrawing(false);
+  };
+
+const clearCanvas = () => {
+  setPaths([]);
+  setCurrentPath([]);
+  setOcrResults(null);
+  setSelectedText('');
+  setError('');
+  
+  // Also clear the canvas visually
+  const canvas = canvasRef.current;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = 'white';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+};
+
+  const undoLastStroke = () => {
+    setPaths(prev => prev.slice(0, -1));
+  };
+
+  // Tool switching functions
+const switchToPen = () => {
+  setTool('pen');
+};
+
+const switchToEraser = () => {
+  setTool('eraser');
+};
+
+
+const handleImageUpload = (event) => {
+  const file = event.target.files[0];
+  if (file && file.type.startsWith('image/')) {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      setUploadedImage(e.target.result);
+      setPreviewImage(e.target.result);
+      setProcessingMode('upload');
+      // Clear any existing results
+      setOcrResults(null);
+      setSelectedText('');
+      setError('');
+    };
+    reader.readAsDataURL(file);
+  } else {
+    setError('Please select a valid image file');
+  }
+};
+
+const clearUploadedImage = () => {
+  setUploadedImage(null);
+  setPreviewImage(null);
+  setProcessingMode('drawing');
+  setOcrResults(null);
+  setSelectedText('');
+  setError('');
+};
+
+  // Canvas drawing effect
+useEffect(() => {
+  const canvas = canvasRef.current;
+  const ctx = canvas.getContext('2d');
+  
+  // Clear canvas with white background
+  ctx.fillStyle = 'white';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  
+  // Draw all paths
+  [...paths, currentPath].forEach(path => {
+    if (path.length > 1) {
+      const pathTool = path[0]?.tool || 'pen';
+      const pathSize = path[0]?.size || brushSize;
+      
+      ctx.beginPath();
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = pathSize;
+      
+      if (pathTool === 'eraser') {
+        // Eraser mode - use destination-out composite operation
+        ctx.globalCompositeOperation = 'destination-out';
+      } else {
+        // Pen mode - normal drawing
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.strokeStyle = '#000';
+      }
+      
+      ctx.moveTo(path[0].x, path[0].y);
+      path.forEach(point => ctx.lineTo(point.x, point.y));
+      ctx.stroke();
+    }
+  });
+  
+  // Reset to normal composite operation
+  ctx.globalCompositeOperation = 'source-over';
+}, [paths, currentPath, brushSize, eraserSize, tool, isMobile]);
+
+  // OCR Processing
+const processOCR = async () => {
+  // NEW: Check based on mode
+  if (processingMode === 'drawing' && paths.length === 0) {
+    setError("Please draw something first!");
+    return;
+  }
+  
+  if (processingMode === 'upload' && !uploadedImage) {
+    setError("Please upload an image first!");
+    return;
+  }
+
+  if (backendStatus !== 'connected') {
+    setError("Backend server is not connected. Please make sure the Flask server is running.");
+    return;
+  }
+
+  setIsProcessing(true);
+  setError('');
+  setOcrResults(null);
+  setSelectedText('');
+  setCorrectionText('');
+  
+  try {
+    let imageDataUrl;
+    
+    // NEW: Choose image source based on mode
+    if (processingMode === 'drawing') {
+      const canvas = canvasRef.current;
+      imageDataUrl = canvas.toDataURL('image/png');
+    } else {
+      imageDataUrl = uploadedImage;
+    }
+    
+    const result = await processOCRWithBackend(imageDataUrl, userId || 'anonymous');
+    console.log('OCR API Result:', result);
+    setOcrResults(result);
+    setCurrentImageHash(result.image_hash || '');
+    
+    const originalText = result.original_text || result.text;
+    if (originalText && originalText.trim()) {
+      setSelectedText(originalText);
+    } else {
+      if (result.refined_data?.suggestions?.length > 0) {
+        setSelectedText(result.refined_data.suggestions[0]);
+      }
+    }
+    
+  } catch (error) {
+    console.error("OCR processing failed:", error);
+    setError(error.message || "Processing failed. Please try again.");
+  } finally {
+    setIsProcessing(false);
+  }
+};
+
+  const selectText = (text) => {
+    setSelectedText(text);
+  };
+
+  const copyToClipboard = () => {
+    if (selectedText) {
+      navigator.clipboard.writeText(selectedText).then(() => {
+        setShowCopiedAlert(true);
+        setTimeout(() => setShowCopiedAlert(false), 2000);
+      }).catch(() => {
+        setError("Failed to copy to clipboard");
+      });
+    }
+  };
+  
+  const submitCorrection = async () => {
+  if (!correctionText.trim() || correctionText === selectedText) {
+    return;
+  }
+  
+  try {
+    const response = await fetch(`${API_BASE_URL}/submit-feedback`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        original_text: selectedText,
+        corrected_text: correctionText.trim(),
+        user_id: userId || 'anonymous',
+        image_hash: currentImageHash,
+        confidence_score: ocrResults?.refined_data?.confidence
+      })
+    });
+
+    const result = await response.json();
+    
+    if (result.success) {
+      // ✅ UPDATE SELECTED TEXT TO USER'S CORRECTION
+      setSelectedText(correctionText.trim());
+      
+      // ✅ SHOW VISUAL FEEDBACK THAT TEXT WAS UPDATED
+      setTextWasUpdated(true);
+      setTimeout(() => setTextWasUpdated(false), 3000);
+      
+      // Show success message
+      setShowCopiedAlert(true);
+      setTimeout(() => setShowCopiedAlert(false), 3000);
+      
+      // Clear correction input
+      setCorrectionText('');
+      setShowCorrectionInput(false);
+      
+      // Fetch updated learning stats
+      // if (userId) {
+      //   fetchLearningStats();
+      // }
+      
+      console.log('✅ Correction submitted and selected text updated');
+    } else {
+      setError('Failed to submit correction: ' + result.error);
+    }
+    
+  } catch (error) {
+    console.error('Correction submission failed:', error);
+    setError('Failed to submit correction. Please try again.');
+  }
+};
+
+  const downloadImage = () => {
+    const canvas = canvasRef.current;
+    const link = document.createElement('a');
+    link.download = `drawing_${Date.now()}.png`;
+    link.href = canvas.toDataURL();
+    link.click();
+  };
+
+  const getStatusIndicator = () => {
+    switch (backendStatus) {
+      case 'checking':
+        return <span className="status-checking">🔄 Checking connection...</span>;
+      case 'connected':
+        return <span className="status-connected">✅ Backend connected</span>;
+      case 'disconnected':
+        return <span className="status-disconnected">❌ Backend disconnected</span>;
+      default:
+        return null;
+    }
+  };
+
+  const getConfidenceBadge = (confidence) => {
+    return `badge badge-${confidence}`;
+  };
+
+  return (
+    <div className="app-container animate-fade-in">
+      {/* Floating background orbs */}
+      <div className="floating-orb orb-1"></div>
+      <div className="floating-orb orb-2"></div>
+      <div className="floating-orb orb-3"></div>
+
+      <div className="content-wrapper">
+        {/* Header */}
+        <header className="header-section">
+          <h1 className="gradient-text main-title">AI-Enhanced Drawing OCR</h1>
+          <p className="subtitle">Draw or write text, and our AI will extract and refine it!</p>
+          <div className="status-indicator">
+            {getStatusIndicator()}
+          </div>
+        </header>
+        {/* User Management Section */}
+        <div className="user-section glass-effect">
+          <div className="section-header">
+            <h3 className="section-title">User Settings</h3>
+          </div>
+          <div className="user-controls">
+            <label>Your User ID (for personalized learning):</label>
+            <input
+              type="text"
+              value={userId}
+              onChange={(e) => setUserId(e.target.value)}
+              placeholder="Enter your name or ID"
+              className="user-input"
+            />
+            <p className="user-hint">
+              Using the same ID helps the system learn your handwriting patterns
+            </p>
+          </div>
+        </div>
+        {/* Mode Selection */}
+        <div className="mode-section glass-effect">
+          <div className="section-header">
+            <h3 className="section-title">Processing Mode</h3>
+          </div>
+          <div className="mode-controls">
+            <button
+              onClick={() => {
+                setProcessingMode('drawing');
+                clearUploadedImage();
+              }}
+              className={`mode-button ${processingMode === 'drawing' ? 'active' : ''}`}
+            >
+              <Pen size={16} />
+              Draw Text
+            </button>
+            <button
+              onClick={() => setProcessingMode('upload')}
+              className={`mode-button ${processingMode === 'upload' ? 'active' : ''}`}
+            >
+              <Camera size={16} />
+              Upload Image
+            </button>
+          </div>
+        </div>
+        {/* Copied Alert */}
+        {showCopiedAlert && (
+          <div className="alert-popup">
+            <CheckCircle size={16} />
+            Copied to clipboard!
+          </div>
+        )}
+
+        <div className="main-content">
+        {/* Image Upload Section */}
+          {processingMode === 'upload' && (
+            <div className="upload-section glass-effect">
+              <div className="section-header">
+                <h2 className="section-title">Image Upload</h2>
+              </div>
+              
+              <div className="upload-container">
+                {!uploadedImage ? (
+                  <div className="upload-zone">
+                    <input
+                      type="file"
+                      id="imageUpload"
+                      accept="image/*"
+                      onChange={handleImageUpload}
+                      style={{ display: 'none' }}
+                    />
+                    <label htmlFor="imageUpload" className="upload-label">
+                      <Camera size={48} />
+                      <p>Click to upload an image</p>
+                      <span>Supports: JPG, PNG, GIF, WebP</span>
+                    </label>
+                  </div>
+                ) : (
+                  <div className="image-preview-container">
+                    <img
+                      src={previewImage}
+                      alt="Uploaded preview"
+                      className="uploaded-image-preview"
+                    />
+                    <div className="upload-controls">
+                      <button
+                        onClick={clearUploadedImage}
+                        className="glow-button btn-danger"
+                      >
+                        <Trash2 size={16} />
+                        Remove Image
+                      </button>
+                      <button
+                        onClick={processOCR}
+                        disabled={isProcessing || backendStatus !== 'connected'}
+                        className={`glow-button btn-success ${isProcessing ? 'processing-pulse' : ''}`}
+                      >
+                        {isProcessing ? <Loader className="animate-spin" size={16} /> : <Camera size={16} />}
+                        {isProcessing ? 'Processing...' : 'Extract Text'}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+          {/* Drawing Pad */}
+          {processingMode === 'drawing' && (
+            <div className="drawing-section glass-effect">
+            <div className="section-header">
+              <h2 className="section-title">Drawing Pad</h2>
+              
+              {/* Tool Selection */}
+              <div className="tool-controls">
+                <div className="tool-buttons">
+                  <button
+                    onClick={switchToPen}
+                    className={`tool-button ${tool === 'pen' ? 'active-tool' : ''}`}
+                    title="Pen Tool"
+                  >
+                    <Pen size={16} />
+                    Pen
+                  </button>
+                  <button
+                    onClick={switchToEraser}
+                    className={`tool-button ${tool === 'eraser' ? 'active-tool' : ''}`}
+                    title="Eraser Tool"
+                  >
+                    <Eraser size={16} />
+                    Eraser
+                  </button>
+                </div>
+                
+                {/* Dynamic Size Control */}
+                <div className="size-controls">
+                  <label>
+                    {tool === 'pen' ? 'Brush' : 'Eraser'} Size:
+                  </label>
+                  <input
+                    type="range"
+                    min={tool === 'pen' ? (isMobile ? 3 : 1) : 5}
+                    max={tool === 'pen' ? (isMobile ? 15 : 10) : 30}
+                    value={tool === 'pen' ? brushSize : eraserSize}
+                    onChange={(e) => {
+                      const size = Number(e.target.value);
+                      if (tool === 'pen') {
+                        setBrushSize(size);
+                      } else {
+                        setEraserSize(size);
+                      }
+                    }}
+                    className="size-slider"
+                  />
+                  <span>
+                    {tool === 'pen' ? brushSize : eraserSize}px 
+                    {isMobile && tool === 'pen' && ' (Mobile Optimized)'}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Canvas */}
+            <div className="canvas-container">
+              <canvas
+                ref={canvasRef}
+                width={1000}
+                height={600}
+                className={`drawing-canvas ${tool === 'eraser' ? 'eraser-cursor' : 'pen-cursor'}`}
+                style={{
+                  touchAction: 'none',
+                  userSelect: 'none',
+                  WebkitUserSelect: 'none',
+                  WebkitTouchCallout: 'none',
+                  WebkitTapHighlightColor: 'transparent'
+                }}
+                onMouseDown={startDrawing}
+                onMouseMove={draw}
+                onMouseUp={stopDrawing}
+                onMouseLeave={stopDrawing}
+                onTouchStart={handleTouchStart}
+                onTouchMove={handleTouchMove}
+                onTouchEnd={handleTouchEnd}
+                onTouchCancel={handleTouchEnd}
+                onContextMenu={(e) => e.preventDefault()}
+              />
+            </div>
+            {/* Tool indicator for mobile */}
+              {isMobile && (
+                <div className="mobile-tool-indicator">
+                  <span className={`tool-indicator ${tool}`}>
+                    {tool === 'pen' ? '✏️ Drawing Mode' : '🧹 Eraser Mode'}
+                  </span>
+                </div>
+              )}
+
+            {/* Drawing Controls */} 
+            <div className="controls-panel">
+              <button
+                onClick={undoLastStroke}
+                className="glow-button btn-warning"
+                disabled={paths.length === 0}
+              >
+                <Eraser size={16} />
+                Undo
+              </button>
+              
+              <button
+                onClick={clearCanvas}
+                className="glow-button btn-danger"
+              >
+                <Trash2 size={16} />
+                Clear
+              </button>
+              
+              <button
+                onClick={downloadImage}
+                className="glow-button btn-info"
+                disabled={paths.length === 0}
+              >
+                <Download size={16} />
+                Download
+              </button>
+              
+              <button
+                onClick={processOCR}
+                disabled={isProcessing || paths.length === 0 || backendStatus !== 'connected'}
+                className={`glow-button btn-success ${isProcessing ? 'processing-pulse' : ''}`}
+              >
+                {isProcessing ? <Loader className="animate-spin" size={16} /> : <Camera size={16} />}
+                {isProcessing ? 'Processing...' : 'Extract Text'}
+              </button>
+            </div>
+          </div>
+          )}
+
+          {/* Results Panel */}
+          <div className="results-section glass-effect">
+            <div className="section-header">
+              <h2 className="section-title">AI Text Detection</h2>
+              {selectedText && (
+                <button
+                  onClick={copyToClipboard}
+                  className="copy-button"
+                  title="Copy selected text"
+                >
+                  <Copy size={14} />
+                  Copy
+                </button>
+              )}
+            </div>
+
+            {/* Error Display */}
+            {error && (
+              <div className="error-message">
+                <AlertCircle size={16} />
+                <p>{error}</p>
+              </div>
+            )}
+
+            {/* Processing State */}
+            {isProcessing && (
+              <div className="processing-state">
+                <div className="processing-spinner">
+                  <Loader className="animate-spin" size={24} />
+                </div>
+                <span>AI is analyzing your drawing...</span>
+              </div>
+            )}
+
+            {/* Results Display */}
+            {ocrResults && !isProcessing && (
+              <div className="results-display custom-scrollbar">
+                {/* Original OCR Text */}
+                <div className="text-option-group">
+                  <h3 className="option-title">
+                    Original OCR Text
+                    <span className="badge badge-original">Original</span>
+                  </h3>
+                  <button
+                    onClick={() => selectText(ocrResults.original_text)}
+                    className={`text-option ${selectedText === ocrResults.original_text ? 'selected-original' : ''}`}
+                  >
+                    <p>{ocrResults.original_text || 'No text detected'}</p>
+                  </button>
+                </div>
+
+                {/* AI Refined Suggestions */}
+                {ocrResults.refined_data?.suggestions && (
+                  <div className="text-option-group">
+                    <h3 className="option-title">
+                      AI Refined Suggestions
+                      <span className={getConfidenceBadge(ocrResults.refined_data.confidence)}>
+                        {ocrResults.refined_data.confidence} confidence
+                      </span>
+                    </h3>
+                    <div className="suggestions-list">
+                      {ocrResults.refined_data.suggestions.map((suggestion, index) => (
+                        <button
+                          key={index}
+                          onClick={() => selectText(suggestion)}
+                          className={`text-option ${selectedText === suggestion ? 'selected-refined' : ''}`}
+                        >
+                          <div className="suggestion-content">
+                            <p>{suggestion}</p>
+                            <span className="option-number">Option {index + 1}</span>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Selected Text Display */}
+                {selectedText && (
+                  <div className={`selected-text-display ${textWasUpdated ? 'text-updated' : ''}`}>
+                    <h4>Selected Text:</h4>
+                     {textWasUpdated && <span className="update-indicator"> ✅ Updated!</span>}
+                    <p>{selectedText}</p>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Instructions */}
+            {!ocrResults && !isProcessing && !error && (
+              <div className="instructions">
+                <Pen className="instruction-icon animate-float" size={32} />
+                <p>Draw or write something on the canvas, then click "Extract Text" to see our AI analyze and refine your text!</p>
+                {backendStatus !== 'connected' && (
+                  <p className="backend-warning">
+                    Make sure the Flask backend server is running on port 5000
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+        
+        {/* Correction Input Section */}
+          {ocrResults && selectedText && (
+            <div className="correction-section glass-effect">
+              <div className="section-header">
+                <h3 className="section-title">Help Improve Accuracy</h3>
+              </div>
+              
+              <div className="correction-container">
+                <p>Is the extracted text incorrect? Help us learn by providing the correct version:</p>
+                
+                <div className="text-comparison">
+                  <div className="text-box">
+                    <label>System Result:</label>
+                    <div className="readonly-text">{selectedText}</div>
+                  </div>
+                  
+                  <div className="text-box">
+                    <label>Correct Text:</label>
+                    <textarea
+                      value={correctionText}
+                      onChange={(e) => setCorrectionText(e.target.value)}
+                      placeholder="Type the correct text here..."
+                      className="correction-textarea"
+                      rows="3"
+                    />
+                  </div>
+                </div>
+                
+                <div className="correction-actions">
+                  <button
+                    onClick={submitCorrection}
+                    disabled={!correctionText.trim() || correctionText === selectedText}
+                    className="glow-button btn-success"
+                  >
+                    <CheckCircle size={16} />
+                    Submit Correction
+                  </button>
+                  
+                  <button
+                    onClick={() => {
+                      setCorrectionText('');
+                      setShowCorrectionInput(false);
+                    }}
+                    className="glow-button btn-secondary"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+
+
+
+
+        {/* Footer */}
+        <footer className="footer">
+          <p>Powered by Azure Computer Vision API + AI Text Refinement</p>
+        </footer>
+      </div>
+
+  );
+};
+
+export default DrawingOCRApp;
+
+

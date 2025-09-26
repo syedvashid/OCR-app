@@ -1,15 +1,21 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import requests
 import base64
 import time
 import os
-from dotenv import load_dotenv
-from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate
+from dotenv import load_dotenv 
+# from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate
 from langchain.chains import LLMChain
 from langchain_core.messages import HumanMessage, SystemMessage
-from configration import  llm1
-from Database import save_user_correction, get_learned_patterns, apply_learned_corrections,create_image_hash, initialize_database, db
+from configration import llm1
+from Database import save_user_correction, get_learned_patterns, apply_learned_corrections, create_image_hash, initialize_database, db
+
+# TrOCR imports
+import torch
+from PIL import Image
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+import io
+import numpy as np
 
 # Load environment variables
 load_dotenv()
@@ -17,61 +23,183 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
-# Azure OCR configuration
-AZURE_ENDPOINT = os.getenv('REACT_APP_AZURE_ENDPOINT')
-AZURE_KEY = os.getenv('REACT_APP_AZURE_KEY')
+# TrOCR Configuration
+class TrOCRConfig:
+    def __init__(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model_name = os.getenv('TROCR_MODEL', 'microsoft/trocr-base-handwritten')  # Default to handwritten text
+        self.processor = None
+        self.model = None
+        self.initialized = False
+    
+    def initialize_model(self):
+        """Initialize TrOCR model and processor"""
+        try:
+            print(f"Initializing TrOCR model: {self.model_name}")
+            print(f"Using device: {self.device}")
+            
+            if torch.cuda.is_available():
+                print(f"CUDA available - GPU: {torch.cuda.get_device_name(0)}")
+                print(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+            else:
+                print("Using CPU for processing")
+            
+            # Load processor and model
+            self.processor = TrOCRProcessor.from_pretrained(self.model_name)
+            self.model = VisionEncoderDecoderModel.from_pretrained(self.model_name)
+            
+            # Move to appropriate device
+            self.model.to(self.device)
+            self.model.eval()  # Set to evaluation mode
+            
+            # Enable memory optimization for local development
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()  # Clear cache
+                # Optional: Enable half precision for memory efficiency (uncomment if needed)
+                # self.model = self.model.half()
+            
+            self.initialized = True
+            print("✅ TrOCR model initialized successfully")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Failed to initialize TrOCR model: {e}")
+            print("💡 Make sure you have installed: pip install torch transformers pillow")
+            return False
+    
+    def is_ready(self):
+        return self.initialized and self.processor is not None and self.model is not None
 
-def process_with_azure_ocr(image_data):
-    """Process image with Azure OCR API"""
+# Global TrOCR instance
+trocr_config = TrOCRConfig()
+
+def preprocess_image(image):
+    """
+    Preprocess image for better OCR results
+    """
     try:
-        # Step 1: Send image for analysis
-        headers = {
-            "Ocp-Apim-Subscription-Key": AZURE_KEY,
-            "Content-Type": "application/octet-stream",
-        }
+        # Convert to RGB if needed
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
         
-        response = requests.post(
-            f"{AZURE_ENDPOINT}/vision/v3.2/read/analyze",
-            headers=headers,
-            data=image_data
-        )
+        # Resize if too large (TrOCR works better with reasonable sizes)
+        max_size = 1024
+        if max(image.size) > max_size:
+            ratio = max_size / max(image.size)
+            new_size = tuple(int(dim * ratio) for dim in image.size)
+            image = image.resize(new_size, Image.Resampling.LANCZOS)
         
-        if not response.ok:
-            raise Exception(f"Azure OCR request failed: {response.status_code}")
+        # Optional: Enhance contrast (uncomment if needed)
+        # from PIL import ImageEnhance
+        # enhancer = ImageEnhance.Contrast(image)
+        # image = enhancer.enhance(1.2)
         
-        # Get operation-location to poll results
-        operation_location = response.headers.get("operation-location")
-        print(f"Operation location: {operation_location}")
+        return image
         
-        if not operation_location:
-            raise Exception("No operation location returned from Azure")
+    except Exception as e:
+        print(f"Image preprocessing error: {e}")
+        return image
+
+def process_with_trocr(image_data):
+    """Process image with TrOCR"""
+    try:
+        if not trocr_config.is_ready():
+            if not trocr_config.initialize_model():
+                raise Exception("TrOCR model not initialized")
         
-        # Step 2: Poll until result is ready
-        poll_headers = {"Ocp-Apim-Subscription-Key": AZURE_KEY}
+        # Convert bytes to PIL Image
+        image = Image.open(io.BytesIO(image_data))
         
-        while True:
-            poll_response = requests.get(operation_location, headers=poll_headers)
-            result = poll_response.json()
+        # Preprocess image
+        image = preprocess_image(image)
+        
+        print(f"Processing image of size: {image.size}")
+        
+        # Process with TrOCR
+        with torch.no_grad():
+            # Prepare image
+            pixel_values = trocr_config.processor(image, return_tensors="pt").pixel_values.to(trocr_config.device)
             
-            if result.get("status") == "succeeded":
-                # Extract text from results
-                extracted_text = ""
-                if "analyzeResult" in result and "readResults" in result["analyzeResult"]:
-                    for page in result["analyzeResult"]["readResults"]:
-                        for line in page.get("lines", []):
-                            extracted_text += line.get("text", "") + " "
-                
-                return extracted_text.strip()
+            # Generate text
+            generated_ids = trocr_config.model.generate(
+                pixel_values,
+                max_length=512,  # Adjust based on your needs
+                num_beams=5,     # Beam search for better results
+                early_stopping=True
+            )
             
-            elif result.get("status") == "failed":
-                raise Exception("OCR processing failed")
+            # Decode generated text
+            generated_text = trocr_config.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
             
-            # Wait before polling again
-            time.sleep(1)
+            print(f"TrOCR extracted text: {generated_text}")
+            return generated_text.strip()
     
     except Exception as error:
-        print(f"Azure OCR error: {error}")
+        print(f"TrOCR processing error: {error}")
         raise Exception(f"OCR processing failed: {str(error)}")
+
+def process_image_in_chunks(image_data, chunk_size=(512, 512), overlap=50):
+    """
+    Process large images in chunks for better accuracy
+    This is useful for documents with multiple lines/sections
+    """
+    try:
+        if not trocr_config.is_ready():
+            if not trocr_config.initialize_model():
+                raise Exception("TrOCR model not initialized")
+        
+        image = Image.open(io.BytesIO(image_data))
+        image = preprocess_image(image)
+        
+        width, height = image.size
+        chunk_width, chunk_height = chunk_size
+        
+        # If image is smaller than chunk size, process normally
+        if width <= chunk_width and height <= chunk_height:
+            return process_with_trocr(image_data)
+        
+        extracted_texts = []
+        
+        # Process in chunks
+        for y in range(0, height, chunk_height - overlap):
+            for x in range(0, width, chunk_width - overlap):
+                # Define chunk boundaries
+                left = max(0, x)
+                top = max(0, y)
+                right = min(width, x + chunk_width)
+                bottom = min(height, y + chunk_height)
+                
+                # Skip if chunk is too small
+                if right - left < 100 or bottom - top < 100:
+                    continue
+                
+                # Extract chunk
+                chunk = image.crop((left, top, right, bottom))
+                
+                # Convert chunk back to bytes
+                chunk_buffer = io.BytesIO()
+                chunk.save(chunk_buffer, format='PNG')
+                chunk_data = chunk_buffer.getvalue()
+                
+                # Process chunk
+                try:
+                    chunk_text = process_with_trocr(chunk_data)
+                    if chunk_text.strip():
+                        extracted_texts.append(chunk_text)
+                except Exception as e:
+                    print(f"Error processing chunk: {e}")
+                    continue
+        
+        # Combine all extracted texts
+        combined_text = ' '.join(extracted_texts)
+        print(f"Combined text from {len(extracted_texts)} chunks: {combined_text}")
+        
+        return combined_text
+        
+    except Exception as e:
+        print(f"Chunk processing error: {e}")
+        # Fallback to normal processing
+        return process_with_trocr(image_data)
 
 def refine_content(content):
     """
@@ -103,8 +231,7 @@ def refine_content(content):
         - "medcine" -> "medicine"
         - "payn" -> "pain"
 
-
-       Format must be exactly the same as i asked
+        Format must be exactly the same as i asked
         """
         
         human_prompt = f"""
@@ -122,11 +249,11 @@ def refine_content(content):
         import json
         try:
             # Clean the response content
-            content = response.content.strip()
-            if content.startswith('```json'):
-                content = content.replace('```json', '').replace('```', '').strip()
+            content_response = response.content.strip()
+            if content_response.startswith('```json'):
+                content_response = content_response.replace('```json', '').replace('```', '').strip()
             
-            refined_data = json.loads(content)
+            refined_data = json.loads(content_response)
             
             # Ensure we have the right structure
             if 'suggestions' not in refined_data:
@@ -170,12 +297,19 @@ def refine_content(content):
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
-    return jsonify({"status": "healthy", "message": "OCR API is running"})
+    trocr_status = "ready" if trocr_config.is_ready() else "not_initialized"
+    return jsonify({
+        "status": "healthy", 
+        "message": "OCR API is running",
+        "trocr_status": trocr_status,
+        "device": str(trocr_config.device),
+        "model": trocr_config.model_name
+    })
 
 @app.route('/process-ocr', methods=['POST'])
 def process_ocr():
     """
-    Process OCR request with learning integration
+    Process OCR request with TrOCR and learning integration
     """
     try:
         # Check if request has JSON data
@@ -185,6 +319,7 @@ def process_ocr():
         # Get base64 image data and user ID
         image_base64 = request.json['image']
         user_id = request.json.get('user_id', 'anonymous')
+        use_chunking = request.json.get('use_chunking', False)  # Optional chunking
         
         # Remove data URL prefix if present
         if ',' in image_base64:
@@ -197,8 +332,12 @@ def process_ocr():
         except Exception as e:
             return jsonify({"error": "Invalid base64 image data"}), 400
         
-        # Process with Azure OCR
-        extracted_text = process_with_azure_ocr(image_data)
+        # Process with TrOCR
+        if use_chunking:
+            extracted_text = process_image_in_chunks(image_data)
+        else:
+            extracted_text = process_with_trocr(image_data)
+            
         print(f"Extracted text: {extracted_text}")
         
         # Apply learned corrections BEFORE LLM processing
@@ -219,7 +358,8 @@ def process_ocr():
             "refined_data": refined_data,
             "image_hash": image_hash,
             "user_id": user_id,
-            "message": "OCR processing completed successfully"
+            "processing_method": "chunked" if use_chunking else "single",
+            "message": "OCR processing completed successfully with TrOCR"
         }
         
         print(f"Sending response: {response_data}")
@@ -230,9 +370,8 @@ def process_ocr():
         return jsonify({
             "success": False,
             "error": str(error),
-            "message": "OCR processing failed"
+            "message": "TrOCR processing failed"
         }), 500
-    
 
 @app.route('/submit-feedback', methods=['POST'])
 def submit_feedback():
@@ -253,9 +392,6 @@ def submit_feedback():
         success = save_user_correction(user_id, original_text, corrected_text, image_hash, confidence_score)
         
         if success:
-            # Update patterns (we'll implement this later)
-            # update_patterns(original_text, corrected_text, user_id)
-            
             return jsonify({
                 "success": True,
                 "message": "Feedback saved successfully",
@@ -273,10 +409,10 @@ def submit_feedback():
             "success": False,
             "error": str(error)
         }), 500
-
+# ? related to database and user stats (feedback mechanism)
 @app.route('/get-user-stats', methods=['GET'])
 def get_user_stats():
-    """Get user correction statistics"""
+    """Get user correction statistics """
     try:
         user_id = request.args.get('user_id', 'anonymous')
         
@@ -302,23 +438,26 @@ def get_user_stats():
             "error": str(error)
         }), 500
 
-@app.route('/test-azure', methods=['GET'])
-def test_azure_connection():
-    """Test Azure API connection"""
+@app.route('/test-trocr', methods=['GET'])
+def test_trocr():
+    """Test TrOCR model initialization and basic functionality"""
     try:
-        if not AZURE_ENDPOINT or not AZURE_KEY:
-            return jsonify({
-                "success": False,
-                "message": "Azure credentials not configured"
-            }), 500
+        if not trocr_config.is_ready():
+            init_success = trocr_config.initialize_model()
+            if not init_success:
+                return jsonify({
+                    "success": False,
+                    "message": "Failed to initialize TrOCR model"
+                }), 500
         
         return jsonify({
             "success": True,
-            "message": "Azure credentials are configured",
-            "endpoint_configured": bool(AZURE_ENDPOINT),
-            "key_configured": bool(AZURE_KEY)
+            "message": "TrOCR is working",
+            "model_name": trocr_config.model_name,
+            "device": str(trocr_config.device),
+            "cuda_available": torch.cuda.is_available()
         })
-    
+        
     except Exception as error:
         return jsonify({
             "success": False,
@@ -341,30 +480,69 @@ def test_llm_connection():
             "error": str(error)
         }), 500
 
+@app.route('/switch-model', methods=['POST'])
+def switch_trocr_model():
+    """Switch TrOCR model (printed/handwritten/etc.)"""
+    try:
+        data = request.json
+        new_model = data.get('model_name')
+        
+        if not new_model:
+            return jsonify({"error": "No model name provided"}), 400
+        
+        # Validate model name
+        valid_models = [
+            'microsoft/trocr-base-printed',
+            'microsoft/trocr-base-handwritten',
+            'microsoft/trocr-large-printed',
+            'microsoft/trocr-large-handwritten'
+        ]
+        
+        if new_model not in valid_models:
+            return jsonify({
+                "error": f"Invalid model. Valid options: {valid_models}"
+            }), 400
+        
+        # Update configuration
+        trocr_config.model_name = new_model
+        trocr_config.initialized = False
+        trocr_config.processor = None
+        trocr_config.model = None
+        
+        # Initialize new model
+        success = trocr_config.initialize_model()
+        
+        if success:
+            return jsonify({
+                "success": True,
+                "message": f"Switched to model: {new_model}",
+                "current_model": trocr_config.model_name
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "message": "Failed to initialize new model"
+            }), 500
+            
+    except Exception as error:
+        return jsonify({
+            "success": False,
+            "error": str(error)
+        }), 500
 
-# using this in local and working fine
-# if __name__ == '__main__':
+# Initialize TrOCR on startup
+@app.before_request
+def initialize_trocr():
+    """Initialize TrOCR model when the app starts"""
+    print("Initializing TrOCR model on startup...")
+    success = trocr_config.initialize_model()
+    if success:
+        print("✅ TrOCR initialized successfully on startup")
+    else:
+        print("❌ Failed to initialize TrOCR on startup")
 
-#     db_connected = initialize_database()
-    
-#     if not db_connected:
-#         print("⚠️  Warning: Running without database - corrections won't be saved")
-#         print("💡 To fix this:")
-#         print("   1. Install MongoDB: https://docs.mongodb.com/manual/installation/")
-#         print("   2. Start MongoDB service")
-#         print("   3. Restart this Flask app")
-
-#     # Check for required environment variables
-#     if not AZURE_ENDPOINT or not AZURE_KEY:
-#         print("Warning: Azure credentials not found in environment variables")
-#         print("Please set AZURE_ENDPOINT and AZURE_KEY in your .env file")
-    
-#     app.run(debug=True, host='0.0.0.0', port=5000)
-
-
-# using this becouse not working on azure
+# For local development
 if __name__ == '__main__':
-
     db_connected = initialize_database()
     
     if not db_connected:
@@ -373,11 +551,28 @@ if __name__ == '__main__':
         print("   1. Install MongoDB: https://docs.mongodb.com/manual/installation/")
         print("   2. Start MongoDB service")
         print("   3. Restart this Flask app")
-
-    # Check for required environment variables
-    if not AZURE_ENDPOINT or not AZURE_KEY:
-        print("Warning: Azure credentials not found in environment variables")
-        print("Please set AZURE_ENDPOINT and AZURE_KEY in your .env file")
     
-    port = int(os.environ.get("PORT", 5000))
-    app.run(debug=False, host="0.0.0.0", port=port)
+    # Initialize TrOCR
+    print("Initializing TrOCR model...")
+    trocr_init_success = trocr_config.initialize_model()
+    if trocr_init_success:
+        print("✅ TrOCR ready for processing")
+    else:
+        print("❌ TrOCR initialization failed - check dependencies")
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
+
+# For Azure deployment (uncomment when deploying)
+# if __name__ == '__main__':
+#     db_connected = initialize_database()
+    
+#     if not db_connected:
+#         print("⚠️  Warning: Running without database - corrections won't be saved")
+    
+#     # Initialize TrOCR
+#     trocr_init_success = trocr_config.initialize_model()
+#     if not trocr_init_success:
+#         print("❌ TrOCR initialization failed")
+    
+#     port = int(os.environ.get("PORT", 5000))
+#     app.run(debug=False, host="0.0.0.0", port=port)

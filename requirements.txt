@@ -1,4 +1,4 @@
-Flask
+Flask   
 Flask-CORS
 requests
 python-dotenv
@@ -8,6 +8,21 @@ langchain_community
 langchain_groq
 pymongo
 python-dotenv
+
+
+
+# Existing dependencies (keep your current versions)
+
+langchain-core
+
+# New TrOCR dependencies
+torch
+torchvision>=0.10.0
+transformers>=4.21.0
+Pillow>=8.3.0
+
+# Optional: For better performance
+accelerate>=0.20.0
 
 
 
