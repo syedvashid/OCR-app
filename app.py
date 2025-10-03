@@ -100,6 +100,59 @@ def preprocess_image(image):
         print(f"Image preprocessing error: {e}")
         return image
 
+import fitz  # PyMuPDF
+
+import fitz  # PyMuPDF
+
+def process_pdf_with_trocr(pdf_data):
+    """
+    Process PDF file using PyMuPDF (no poppler needed)
+    """
+    try:
+        all_text = []
+        
+        # Open PDF from bytes
+        pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
+        
+        print(f"Processing PDF with {len(pdf_document)} page(s)")
+        
+        for page_num in range(len(pdf_document)):
+            page = pdf_document[page_num]
+            
+            print(f"Processing page {page_num + 1}...")
+            
+            # Render page to image (300 DPI)
+            mat = fitz.Matrix(300/72, 300/72)  # 300 DPI scaling
+            pix = page.get_pixmap(matrix=mat)
+            
+            # Convert pixmap to PIL Image first, then to bytes
+            # This fixes the "cannot identify image file" error
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            
+            # Convert PIL Image to bytes
+            img_buffer = io.BytesIO()
+            img.save(img_buffer, format='PNG')
+            img_data = img_buffer.getvalue()
+            
+            # Process with TrOCR
+            page_text = process_with_trocr(img_data)
+            
+            if page_text.strip():
+                all_text.append(f"[Page {page_num + 1}]\n{page_text}")
+        
+        pdf_document.close()
+        
+        # Combine all pages
+        combined_text = "\n\n".join(all_text)
+        return combined_text if combined_text else "No text detected in PDF"
+        
+    except Exception as error:
+        print(f"PDF processing error: {error}")
+        import traceback
+        traceback.print_exc()
+        raise Exception(f"PDF processing failed: {str(error)}")
+
+
 def process_with_trocr(image_data):
     """Process image with TrOCR"""
     try:
@@ -305,21 +358,19 @@ def health_check():
         "device": str(trocr_config.device),
         "model": trocr_config.model_name
     })
-
 @app.route('/process-ocr', methods=['POST'])
 def process_ocr():
     """
-    Process OCR request with TrOCR and learning integration
+    Process OCR request with TrOCR - supports images and PDFs
     """
     try:
-        # Check if request has JSON data
         if not request.json or 'image' not in request.json:
-            return jsonify({"error": "No image data provided"}), 400
+            return jsonify({"error": "No data provided"}), 400
         
-        # Get base64 image data and user ID
         image_base64 = request.json['image']
         user_id = request.json.get('user_id', 'anonymous')
-        use_chunking = request.json.get('use_chunking', False)  # Optional chunking
+        use_chunking = request.json.get('use_chunking', False)
+        file_type = request.json.get('file_type', 'image')  # ADD THIS LINE
         
         # Remove data URL prefix if present
         if ',' in image_base64:
@@ -327,24 +378,32 @@ def process_ocr():
         
         # Decode base64 to binary data
         try:
-            image_data = base64.b64decode(image_base64)
-            image_hash = create_image_hash(image_data)
+            file_data = base64.b64decode(image_base64)
+            image_hash = create_image_hash(file_data)
         except Exception as e:
-            return jsonify({"error": "Invalid base64 image data"}), 400
+            return jsonify({"error": "Invalid base64 data"}), 400
         
-        # Process with TrOCR
-        if use_chunking:
-            extracted_text = process_image_in_chunks(image_data)
+        # ADD THIS SECTION - Process based on file type
+        print(f"Processing file type: {file_type}")
+        
+        if file_type == 'pdf':
+            extracted_text = process_pdf_with_trocr(file_data)
         else:
-            extracted_text = process_with_trocr(image_data)
-            
+            # Image processing (existing logic)
+            if use_chunking:
+                extracted_text = process_image_in_chunks(file_data)
+            else:
+                extracted_text = process_with_trocr(file_data)
+        
         print(f"Extracted text: {extracted_text}")
         
-        # Apply learned corrections BEFORE LLM processing
-        learned_corrected_text, applied_corrections = apply_learned_corrections(extracted_text, user_id)
+        # Apply learned corrections
+        learned_corrected_text, applied_corrections = apply_learned_corrections(
+            extracted_text, user_id
+        )
         print(f"Applied corrections: {applied_corrections}")
         
-        # Refine content with LLM using the learned-corrected text
+        # Refine content with LLM
         refined_data = None
         if learned_corrected_text and learned_corrected_text.strip():
             refined_data = refine_content(learned_corrected_text)
@@ -358,6 +417,7 @@ def process_ocr():
             "refined_data": refined_data,
             "image_hash": image_hash,
             "user_id": user_id,
+            "file_type": file_type,  # ADD THIS
             "processing_method": "chunked" if use_chunking else "single",
             "message": "OCR processing completed successfully with TrOCR"
         }
@@ -367,6 +427,8 @@ def process_ocr():
     
     except Exception as error:
         print(f"OCR processing error: {error}")
+        import traceback
+        traceback.print_exc()  # ADD THIS for better error tracking
         return jsonify({
             "success": False,
             "error": str(error),

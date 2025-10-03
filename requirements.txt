@@ -26,3 +26,11 @@ accelerate>=0.20.0
 
 
 
+# for pdf
+PyMuPDF
+pdf2image
+Pillow
+
+
+
+
